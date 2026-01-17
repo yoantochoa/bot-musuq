@@ -32,10 +32,31 @@ app.get("/webhook", (req, res) => {
   }
 });
 
-// 3. Ruta para RECIBIR MENSAJES (POST)
+// 3. Ruta para RECIBIR MENSAJES
 app.post("/webhook", async (req, res) => {
-  console.log("Mensaje recibido:");
-  // console.log(JSON.stringify(req.body, null, 2)); // Descomenta si quieres ver detalles
+  // 1. Imprimir todo el JSON bonito para ver qué llega
+  console.log("📩 JSON COMPLETO:");
+  console.log(JSON.stringify(req.body, null, 2));
+
+  // 2. Intentar sacar solo el texto y el número
+  try {
+    const entry = req.body.entry?.[0];
+    const changes = entry?.changes?.[0];
+    const value = changes?.value;
+    const message = value?.messages?.[0];
+
+    if (message && message.type === "text") {
+      const numero = message.from;
+      const texto = message.text.body;
+      console.log("------------------------------------------------");
+      console.log(`📱 DE: ${numero}`);
+      console.log(`💬 DICE: ${texto}`);
+      console.log("------------------------------------------------");
+    }
+  } catch (error) {
+    console.log("No se pudo leer el mensaje simple.");
+  }
+
   res.sendStatus(200);
 });
 
