@@ -1,67 +1,131 @@
 import express from "express";
-import axios from "axios"; // Lo necesitarás pronto para enviar mensajes
+import axios from "axios";
 import dotenv from "dotenv";
+import { createClient } from "@supabase/supabase-js";
+import { GoogleGenerativeAI } from "@google/generative-ai"; // <--- CAMBIO AQUÍ
 
 dotenv.config();
 
+// --- 1. CONFIGURACIÓN ---
 const app = express();
 app.use(express.json());
 
-// 1. Ruta de prueba (para ver si funciona en el navegador)
-app.get("/", (req, res) => {
-  res.send("Bot Musuq activo 🚀");
-});
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// 2. Ruta de VERIFICACIÓN (¡Esto es lo que le falta a tu código!)
-// Facebook llamará aquí para conectar por primera vez.
+// Configuración de GEMINI (Google)
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+// Usamos el modelo "flash" que es rápido para chat
+const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+
+const PORT = process.env.PORT || 3000;
+const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
+const WHATSAPP_PHONE_ID = process.env.WHATSAPP_PHONE_ID;
+
+// --- 2. FUNCIONES ---
+
+async function enviarMensajeWhatsApp(telefono, texto) {
+  try {
+    await axios({
+      method: "POST",
+      url: `https://graph.facebook.com/v17.0/${WHATSAPP_PHONE_ID}/messages`,
+      headers: {
+        "Authorization": `Bearer ${WHATSAPP_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      data: {
+        messaging_product: "whatsapp",
+        to: telefono,
+        type: "text",
+        text: { body: texto },
+      },
+    });
+  } catch (error) {
+    console.error("❌ Error WhatsApp:", error.response?.data || error.message);
+  }
+}
+
+async function obtenerResumenRestaurantes() {
+  const { data, error } = await supabase.from('restaurants').select('name, description').eq('is_active', true);
+  if (error || !data) return "No hay restaurantes activos.";
+  return data.map(r => `- ${r.name}: ${r.description}`).join("\n");
+}
+
+// --- NUEVA FUNCIÓN CON GEMINI ---
+async function generarRespuestaIA(mensajeUsuario, nombreUsuario, infoRestaurantes) {
+  try {
+    // 1. Definimos la personalidad (Prompt del Sistema)
+    const promptSistema = `
+      Eres "MusuqBot", el asistente de delivery peruano.
+      Cliente: ${nombreUsuario}.
+      
+      Restaurantes Disponibles:
+      ${infoRestaurantes}
+
+      Instrucciones:
+      - Responde de forma breve y amable (máximo 2 frases).
+      - Usa jergas peruanas suaves (tipo "¡Habla!", "al toque", "buenazo").
+      - Tu meta es vender. Si piden carta, resume qué tipos de comida hay.
+    `;
+
+    // 2. Unimos todo para enviarlo a Gemini
+    const promptFinal = `${promptSistema}\n\nCliente dice: "${mensajeUsuario}"\nMusuqBot responde:`;
+
+    // 3. Generamos contenido
+    const result = await model.generateContent(promptFinal);
+    const response = await result.response;
+    return response.text();
+    
+  } catch (error) {
+    console.error("❌ Error Gemini:", error);
+    return "Uy, se me fue la señal un toque 📡. ¿Qué me decías?";
+  }
+}
+
+// --- 3. RUTAS ---
+app.get("/", (req, res) => res.send("🤖 Bot Musuq (Powered by Gemini) 🚀"));
+
 app.get("/webhook", (req, res) => {
-  // Esta contraseña debe coincidir con la que pongas en Facebook
   const verify_token = "musuq123";
-
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
-
-  if (mode && token) {
-    if (mode === "subscribe" && token === verify_token) {
-      console.log("WEBHOOK_VERIFIED");
-      res.status(200).send(challenge);
-    } else {
-      res.sendStatus(403);
-    }
+  if (req.query["hub.mode"] === "subscribe" && req.query["hub.verify_token"] === verify_token) {
+    res.status(200).send(req.query["hub.challenge"]);
+  } else {
+    res.sendStatus(403);
   }
 });
 
-// 3. Ruta para RECIBIR MENSAJES
 app.post("/webhook", async (req, res) => {
-  // 1. Imprimir todo el JSON bonito para ver qué llega
-  console.log("📩 JSON COMPLETO:");
-  console.log(JSON.stringify(req.body, null, 2));
+  res.sendStatus(200);
 
-  // 2. Intentar sacar solo el texto y el número
   try {
-    const entry = req.body.entry?.[0];
-    const changes = entry?.changes?.[0];
-    const value = changes?.value;
-    const message = value?.messages?.[0];
+    const message = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
 
     if (message && message.type === "text") {
-      const numero = message.from;
+      const telefono = message.from;
+      const nombre = req.body.entry[0].changes[0].value.contacts[0].profile.name;
       const texto = message.text.body;
-      console.log("------------------------------------------------");
-      console.log(`📱 DE: ${numero}`);
-      console.log(`💬 DICE: ${texto}`);
-      console.log("------------------------------------------------");
+
+      console.log(`📩 ${nombre}: ${texto}`);
+
+      // 1. Verificar usuario en BD
+      let { data: usuario } = await supabase.from('users').select('*').eq('phone_number', telefono).single();
+      
+      if (!usuario) {
+        const { data: nuevo } = await supabase.from('users').insert([{ phone_number: telefono, full_name: nombre }]).select().single();
+        usuario = nuevo;
+      }
+
+      // 2. Obtener data real
+      const restaurantes = await obtenerResumenRestaurantes();
+
+      // 3. Pensar con GEMINI
+      const respuesta = await generarRespuestaIA(texto, nombre, restaurantes);
+
+      // 4. Responder
+      await enviarMensajeWhatsApp(telefono, respuesta);
     }
   } catch (error) {
-    console.log("No se pudo leer el mensaje simple.");
+    console.error("Error webhook:", error.message);
   }
-
-  res.sendStatus(200);
 });
 
-// Arrancar servidor
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("Servidor listo en puerto " + PORT);
-});
+app.listen(PORT, () => console.log(`🚀 Musuq con Gemini corriendo en puerto ${PORT}`));
