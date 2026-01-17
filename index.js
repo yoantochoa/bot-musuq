@@ -128,4 +128,8 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`🚀 Musuq con Gemini corriendo en puerto ${PORT}`));
+// --- 4. ARRANCAR SERVIDOR ---
+// El '0.0.0.0' es OBLIGATORIO en Railway/Render para que escuche fuera del contenedor
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Servidor Musuq corriendo en puerto ${PORT}`);
+});
