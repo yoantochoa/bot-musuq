@@ -15,7 +15,7 @@ const PORT = process.env.PORT || 3000;
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const WHATSAPP_PHONE_ID = process.env.WHATSAPP_PHONE_ID;
 
-// Memoria de sesiones de usuario
+// Memoria de sesiones
 const sesiones = new Map();
 
 // --- CONSTANTES ---
@@ -25,10 +25,11 @@ const ESTADOS = {
   VIENDO_MENU: 'viendo_menu',
   AGREGANDO_ITEMS: 'agregando_items',
   CONFIRMANDO_CARRITO: 'confirmando_carrito',
-  INGRESANDO_DIRECCION: 'ingresando_direccion',
+  GESTIONANDO_DIRECCION: 'gestionando_direccion', // NUEVO
+  SELECCIONANDO_DIRECCION_GUARDADA: 'seleccionando_direccion_guardada', // NUEVO
+  INGRESANDO_DIRECCION_NUEVA: 'ingresando_direccion_nueva',
   CONFIRMANDO_UBICACION: 'confirmando_ubicacion',
   SELECCIONANDO_PAGO: 'seleccionando_pago',
-  GENERANDO_PEDIDO: 'generando_pedido',
   PEDIDO_ACTIVO: 'pedido_activo'
 };
 
@@ -37,7 +38,7 @@ const METODOS_PAGO = {
   YAPE: 'Yape',
   PLIN: 'Plin',
   TRANSFERENCIA: 'Transferencia',
-  TARJETA: 'Tarjeta (POS en delivery)'
+  TARJETA: 'Tarjeta (POS)'
 };
 
 // --- FUNCIONES AUXILIARES ---
@@ -58,9 +59,46 @@ async function enviarMensajeWhatsApp(telefono, texto) {
         text: { body: texto },
       },
     });
-    console.log("✅ Mensaje enviado a", telefono);
+    console.log("✅ Mensaje enviado");
   } catch (error) {
     console.error("❌ Error WhatsApp:", error.response?.data || error.message);
+  }
+}
+
+// NUEVO: Enviar mensaje con botones interactivos
+async function enviarMensajeConBotones(telefono, texto, botones) {
+  try {
+    const buttons = botones.map((btn, idx) => ({
+      type: "reply",
+      reply: {
+        id: `btn_${idx}`,
+        title: btn.substring(0, 20) // WhatsApp limita a 20 caracteres
+      }
+    }));
+
+    await axios({
+      method: "POST",
+      url: `https://graph.facebook.com/v17.0/${WHATSAPP_PHONE_ID}/messages`,
+      headers: {
+        "Authorization": `Bearer ${WHATSAPP_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      data: {
+        messaging_product: "whatsapp",
+        to: telefono,
+        type: "interactive",
+        interactive: {
+          type: "button",
+          body: { text: texto },
+          action: { buttons: buttons.slice(0, 3) } // Máximo 3 botones
+        }
+      },
+    });
+    console.log("✅ Mensaje con botones enviado");
+  } catch (error) {
+    console.error("❌ Error enviando botones:", error.response?.data || error.message);
+    // Fallback: enviar como texto normal
+    await enviarMensajeWhatsApp(telefono, texto + "\n\n" + botones.map((b, i) => `${i+1}. ${b}`).join("\n"));
   }
 }
 
@@ -74,7 +112,9 @@ function obtenerSesion(telefono) {
       ubicacion: null,
       metodoPago: null,
       pedidoActual: null,
-      mensajeAnterior: null
+      direccionesGuardadas: [],
+      distanciaKm: 0,
+      tiempoEstimado: 30
     });
   }
   return sesiones.get(telefono);
@@ -87,6 +127,7 @@ function actualizarSesion(telefono, datos) {
 }
 
 function limpiarSesion(telefono) {
+  const sesionAnterior = obtenerSesion(telefono);
   sesiones.set(telefono, {
     estado: ESTADOS.INICIO,
     restaurante: null,
@@ -95,7 +136,9 @@ function limpiarSesion(telefono) {
     ubicacion: null,
     metodoPago: null,
     pedidoActual: null,
-    mensajeAnterior: null
+    direccionesGuardadas: sesionAnterior.direccionesGuardadas || [],
+    distanciaKm: 0,
+    tiempoEstimado: 30
   });
 }
 
@@ -103,9 +146,33 @@ function calcularSubtotal(carrito) {
   return carrito.reduce((total, item) => total + (item.precio * item.cantidad), 0);
 }
 
-function calcularDelivery(ubicacion) {
-  // Por ahora tarifa fija, después puedes calcular por distancia
-  return 5.00;
+// NUEVO: Calcular delivery basado en distancia
+async function calcularDelivery(restaurantId, latCliente, lngCliente) {
+  if (!latCliente || !lngCliente) {
+    return { costo: 5.00, distancia: 0, tiempo: 30 };
+  }
+
+  try {
+    const { data, error } = await supabase.rpc('calculate_delivery_cost', {
+      restaurant_id_param: restaurantId,
+      customer_lat: latCliente,
+      customer_lon: lngCliente
+    });
+
+    if (error) throw error;
+
+    if (data && data.length > 0) {
+      return {
+        costo: parseFloat(data[0].delivery_cost),
+        distancia: parseFloat(data[0].distance_km),
+        tiempo: parseInt(data[0].estimated_time_minutes)
+      };
+    }
+  } catch (error) {
+    console.error("Error calculando delivery:", error);
+  }
+
+  return { costo: 5.00, distancia: 0, tiempo: 30 };
 }
 
 function generarNumeroOrden() {
@@ -136,9 +203,9 @@ function formatearCarrito(carrito) {
   return texto;
 }
 
-function generarVoucher(pedido) {
+function generarVoucher(pedido, deliveryInfo) {
   const subtotal = calcularSubtotal(pedido.carrito);
-  const delivery = pedido.costoDelivery;
+  const delivery = deliveryInfo.costo;
   const total = subtotal + delivery;
   
   let voucher = `╔═══════════════════════════════╗
@@ -154,6 +221,7 @@ function generarVoucher(pedido) {
 
 🏪 *RESTAURANTE:*
 ${pedido.restaurante.name}
+📍 ${pedido.restaurante.address || 'Sin dirección'}
 
 🛒 *PEDIDO:*
 `;
@@ -169,21 +237,32 @@ ${pedido.restaurante.name}
   voucher += `
 ━━━━━━━━━━━━━━━━━━━━━━━
 📦 *Subtotal:* S/ ${subtotal.toFixed(2)}
-🏍️ *Delivery:* S/ ${delivery.toFixed(2)}
+🏍️ *Delivery:* S/ ${delivery.toFixed(2)}`;
+
+  if (deliveryInfo.distancia > 0) {
+    voucher += `\n   📏 Distancia: ${deliveryInfo.distancia.toFixed(2)} km`;
+  }
+
+  voucher += `
 ━━━━━━━━━━━━━━━━━━━━━━━
 💰 *TOTAL:* S/ ${total.toFixed(2)}
 
 📍 *DIRECCIÓN DE ENTREGA:*
-${pedido.direccion}
-${pedido.referencia ? `🏢 Ref: ${pedido.referencia}` : ''}
+${pedido.direccion}`;
+
+  if (pedido.referencia) {
+    voucher += `\n🏢 Ref: ${pedido.referencia}`;
+  }
+
+  voucher += `
 
 💳 *MÉTODO DE PAGO:*
 ${pedido.metodoPago}
 
-⏱️ *Tiempo estimado:* 35-45 min
+⏱️ *Tiempo estimado:* ${deliveryInfo.tiempo || 30} min
 
 ━━━━━━━━━━━━━━━━━━━━━━━
-📞 Para consultas: +51 987 654 321
+📞 Soporte: +51 987 654 321
 ━━━━━━━━━━━━━━━━━━━━━━━
 
 ✅ *Tu pedido ha sido confirmado*
@@ -228,17 +307,65 @@ async function obtenerMenuRestaurante(restaurantId) {
   return data || [];
 }
 
-async function crearPedido(telefono, sesion) {
+// NUEVO: Obtener direcciones guardadas del usuario
+async function obtenerDireccionesGuardadas(userId) {
+  const { data, error } = await supabase
+    .from('user_addresses')
+    .select('*')
+    .eq('user_id', userId)
+    .order('is_default DESC, created_at DESC');
+  
+  if (error) {
+    console.error("Error obteniendo direcciones:", error);
+    return [];
+  }
+  
+  return data || [];
+}
+
+// NUEVO: Guardar nueva dirección
+async function guardarDireccion(userId, datos) {
+  const { data, error } = await supabase
+    .from('user_addresses')
+    .insert([{
+      user_id: userId,
+      label: datos.label || 'Otra',
+      address: datos.address,
+      reference: datos.reference,
+      latitude: datos.latitude,
+      longitude: datos.longitude,
+      is_default: datos.is_default || false
+    }])
+    .select()
+    .single();
+  
+  if (error) {
+    console.error("Error guardando dirección:", error);
+    return null;
+  }
+  
+  return data;
+}
+
+async function crearPedido(telefono, sesion, deliveryInfo) {
   const numeroOrden = generarNumeroOrden();
   const subtotal = calcularSubtotal(sesion.carrito);
-  const delivery = calcularDelivery(sesion.ubicacion);
+  const delivery = deliveryInfo.costo;
   const total = subtotal + delivery;
   
-  // Crear pedido en BD
+  // Obtener usuario
+  const { data: usuario } = await supabase
+    .from('users')
+    .select('id')
+    .eq('phone_number', telefono)
+    .single();
+  
+  // Crear pedido
   const { data: pedido, error: errorPedido } = await supabase
     .from('orders')
     .insert([{
       order_number: numeroOrden,
+      user_id: usuario?.id,
       restaurant_id: sesion.restaurante.id,
       customer_phone: telefono,
       delivery_address: sesion.direccion,
@@ -248,9 +375,8 @@ async function crearPedido(telefono, sesion) {
       payment_method: sesion.metodoPago,
       subtotal: subtotal,
       delivery_fee: delivery,
-      total: total,
+      total_amount: total,
       status: 'PENDING',
-      items: sesion.carrito,
       created_at: new Date().toISOString()
     }])
     .select()
@@ -260,6 +386,19 @@ async function crearPedido(telefono, sesion) {
     console.error("Error creando pedido:", errorPedido);
     throw new Error("No se pudo crear el pedido");
   }
+  
+  // Crear items del pedido
+  const orderItems = sesion.carrito.map(item => ({
+    order_id: pedido.id,
+    menu_item_id: item.menuItemId,
+    quantity: item.cantidad,
+    unit_price: item.precio,
+    notes: item.notas
+  }));
+  
+  await supabase
+    .from('order_items')
+    .insert(orderItems);
   
   return pedido;
 }
@@ -290,7 +429,7 @@ async function manejarInicio(telefono, nombre) {
   
   if (restaurantes.length === 0) {
     return {
-      mensaje: "😔 Lo sentimos, no hay restaurantes disponibles en este momento.\n\nIntenta más tarde.",
+      mensaje: "😔 No hay restaurantes disponibles.\n\nIntenta más tarde.",
       nuevoEstado: ESTADOS.INICIO
     };
   }
@@ -301,12 +440,14 @@ async function manejarInicio(telefono, nombre) {
   restaurantes.forEach((rest, index) => {
     mensaje += `*${index + 1}.* ${rest.name}\n`;
     mensaje += `   ${rest.description || 'Deliciosa comida'}\n`;
-    mensaje += `   ⏱️ ${rest.delivery_time || '30-40'} min\n\n`;
+    if (rest.address) {
+      mensaje += `   📍 ${rest.address}\n`;
+    }
+    mensaje += `   ⏱️ ${rest.delivery_time || '30-40 min'}\n\n`;
   });
   
   mensaje += `━━━━━━━━━━━━━━━━━━━━━━━\n`;
-  mensaje += `📝 Escribe el *número* del restaurante\n`;
-  mensaje += `Ejemplo: *1*`;
+  mensaje += `📝 Escribe el *número* del restaurante`;
   
   return {
     mensaje,
@@ -343,11 +484,15 @@ async function manejarSeleccionRestaurante(telefono, mensaje, sesion) {
     categorias[cat].push(item);
   });
   
-  let respuesta = `🍽️ *${restaurante.name.toUpperCase()}*\n\n`;
+  let respuesta = `🍽️ *${restaurante.name.toUpperCase()}*\n`;
+  if (restaurante.address) {
+    respuesta += `📍 ${restaurante.address}\n`;
+  }
+  respuesta += `\n`;
   
   Object.keys(categorias).forEach(categoria => {
     respuesta += `━━ *${categoria}* ━━\n\n`;
-    categorias[categoria].forEach((item, index) => {
+    categorias[categoria].forEach((item) => {
       const itemNum = menuItems.indexOf(item) + 1;
       respuesta += `*${itemNum}.* ${item.name}\n`;
       respuesta += `   S/ ${item.price.toFixed(2)}\n`;
@@ -359,12 +504,12 @@ async function manejarSeleccionRestaurante(telefono, mensaje, sesion) {
   });
   
   respuesta += `━━━━━━━━━━━━━━━━━━━━━━━\n`;
-  respuesta += `📝 Para ordenar escribe:\n`;
-  respuesta += `*Número Cantidad* (opcional: notas)\n\n`;
+  respuesta += `📝 Para ordenar:\n`;
+  respuesta += `*Número Cantidad* (notas opcionales)\n\n`;
   respuesta += `Ejemplos:\n`;
-  respuesta += `• *1 2* (2 unidades del item 1)\n`;
-  respuesta += `• *3 1 sin cebolla* (1 unidad sin cebolla)\n\n`;
-  respuesta += `Cuando termines escribe: *LISTO*`;
+  respuesta += `• *1 2*\n`;
+  respuesta += `• *3 1 sin cebolla*\n\n`;
+  respuesta += `Escribe *LISTO* cuando termines`;
   
   return {
     mensaje: respuesta,
@@ -380,28 +525,24 @@ async function manejarSeleccionRestaurante(telefono, mensaje, sesion) {
 function manejarAgregarItems(telefono, mensaje, sesion) {
   const textoLimpio = mensaje.trim().toUpperCase();
   
-  // Comandos especiales
   if (textoLimpio === 'LISTO' || textoLimpio === 'YA' || textoLimpio === 'CONFIRMAR') {
     if (sesion.carrito.length === 0) {
       return {
-        mensaje: "❌ Tu carrito está vacío.\n\nAgrega al menos un item antes de continuar.",
+        mensaje: "❌ Tu carrito está vacío.\n\nAgrega al menos un item.",
         nuevoEstado: ESTADOS.AGREGANDO_ITEMS
       };
     }
     
     const carritoTexto = formatearCarrito(sesion.carrito);
     const subtotal = calcularSubtotal(sesion.carrito);
-    const delivery = 5.00; // Fijo por ahora
-    const total = subtotal + delivery;
     
-    let respuesta = carritoTexto + `\n`;
-    respuesta += `🏍️ *Delivery:* S/ ${delivery.toFixed(2)}\n`;
+    let respuesta = carritoTexto + `\n\n`;
     respuesta += `━━━━━━━━━━━━━━━━━━━━━━━\n`;
-    respuesta += `💰 *TOTAL:* S/ ${total.toFixed(2)}\n\n`;
+    respuesta += `💰 *Subtotal:* S/ ${subtotal.toFixed(2)}\n`;
+    respuesta += `🏍️ *Delivery:* Se calculará según tu ubicación\n\n`;
     respuesta += `¿Todo correcto?\n\n`;
-    respuesta += `✅ Escribe *SI* para continuar\n`;
-    respuesta += `❌ Escribe *NO* para modificar\n`;
-    respuesta += `🗑️ Escribe *VACIAR* para empezar de nuevo`;
+    respuesta += `✅ *SI* para continuar\n`;
+    respuesta += `❌ *NO* para modificar`;
     
     return {
       mensaje: respuesta,
@@ -411,20 +552,20 @@ function manejarAgregarItems(telefono, mensaje, sesion) {
   
   if (textoLimpio === 'VER' || textoLimpio === 'CARRITO') {
     return {
-      mensaje: formatearCarrito(sesion.carrito) + `\n\nEscribe *LISTO* cuando termines de agregar items.`,
+      mensaje: formatearCarrito(sesion.carrito) + `\n\nEscribe *LISTO* cuando termines.`,
       nuevoEstado: ESTADOS.AGREGANDO_ITEMS
     };
   }
   
-  if (textoLimpio === 'VACIAR' || textoLimpio === 'BORRAR') {
+  if (textoLimpio === 'VACIAR') {
     return {
-      mensaje: "🗑️ Carrito vaciado.\n\nAgrega nuevos items o escribe *MENU* para cambiar de restaurante.",
+      mensaje: "🗑️ Carrito vaciado.\n\nAgrega nuevos items o *MENU* para cambiar de restaurante.",
       nuevoEstado: ESTADOS.AGREGANDO_ITEMS,
       datos: { carrito: [] }
     };
   }
   
-  // Parsear input: "número cantidad notas"
+  // Parsear input
   const partes = mensaje.trim().split(/\s+/);
   const itemNum = parseInt(partes[0]);
   const cantidad = partes.length > 1 ? parseInt(partes[1]) : 1;
@@ -432,22 +573,21 @@ function manejarAgregarItems(telefono, mensaje, sesion) {
   
   if (isNaN(itemNum) || itemNum < 1 || itemNum > sesion.menuItems.length) {
     return {
-      mensaje: `❌ Item #${itemNum} no existe.\n\nEscribe un número del 1 al ${sesion.menuItems.length}`,
+      mensaje: `❌ Item #${itemNum} no existe.\n\nEscribe 1-${sesion.menuItems.length}`,
       nuevoEstado: ESTADOS.AGREGANDO_ITEMS
     };
   }
   
   if (isNaN(cantidad) || cantidad < 1) {
     return {
-      mensaje: "❌ Cantidad inválida.\n\nDebe ser un número mayor a 0.",
+      mensaje: "❌ Cantidad inválida.",
       nuevoEstado: ESTADOS.AGREGANDO_ITEMS
     };
   }
   
   const itemMenu = sesion.menuItems[itemNum - 1];
-  
-  // Agregar al carrito
   const carritoActual = sesion.carrito || [];
+  
   carritoActual.push({
     menuItemId: itemMenu.id,
     nombre: itemMenu.name,
@@ -456,16 +596,13 @@ function manejarAgregarItems(telefono, mensaje, sesion) {
     notas: notas
   });
   
-  let respuesta = `✅ Agregado al carrito:\n\n`;
+  let respuesta = `✅ Agregado:\n\n`;
   respuesta += `${cantidad}x ${itemMenu.name}\n`;
   respuesta += `S/ ${(itemMenu.price * cantidad).toFixed(2)}\n`;
-  if (notas) {
-    respuesta += `📝 ${notas}\n`;
-  }
+  if (notas) respuesta += `📝 ${notas}\n`;
   respuesta += `\n━━━━━━━━━━━━━━━━━━━━━━━\n`;
-  respuesta += `Items en carrito: ${carritoActual.length}\n`;
-  respuesta += `Subtotal: S/ ${calcularSubtotal(carritoActual).toFixed(2)}\n\n`;
-  respuesta += `Agrega más items o escribe *LISTO*`;
+  respuesta += `Items: ${carritoActual.length} | Subtotal: S/ ${calcularSubtotal(carritoActual).toFixed(2)}\n\n`;
+  respuesta += `Agrega más o escribe *LISTO*`;
   
   return {
     mensaje: respuesta,
@@ -477,68 +614,153 @@ function manejarAgregarItems(telefono, mensaje, sesion) {
 function manejarConfirmarCarrito(telefono, mensaje, sesion) {
   const textoLimpio = mensaje.trim().toUpperCase();
   
-  if (textoLimpio === 'SI' || textoLimpio === 'SÍ' || textoLimpio === 'CONFIRMAR' || textoLimpio === 'OK') {
-    let respuesta = `📍 *DIRECCIÓN DE ENTREGA*\n\n`;
-    respuesta += `Envíame tu dirección completa.\n\n`;
-    respuesta += `Ejemplo:\n`;
-    respuesta += `_Av. Arequipa 1234, dpto 501_\n`;
-    respuesta += `_Urbanización Los Pinos, Mz D Lt 15_\n\n`;
-    respuesta += `💡 También puedes enviar tu *ubicación* 📍`;
-    
+  if (textoLimpio === 'SI' || textoLimpio === 'SÍ' || textoLimpio === 'OK') {
     return {
-      mensaje: respuesta,
-      nuevoEstado: ESTADOS.INGRESANDO_DIRECCION
+      mensaje: "Cargando tus direcciones...",
+      nuevoEstado: ESTADOS.GESTIONANDO_DIRECCION
     };
   }
   
-  if (textoLimpio === 'NO' || textoLimpio === 'MODIFICAR') {
-    let respuesta = `🔄 Puedes modificar tu pedido:\n\n`;
-    respuesta += formatearCarrito(sesion.carrito) + `\n\n`;
-    respuesta += `• Escribe *VACIAR* para empezar de nuevo\n`;
-    respuesta += `• Agrega más items\n`;
-    respuesta += `• Escribe *LISTO* cuando termines`;
-    
+  if (textoLimpio === 'NO') {
     return {
-      mensaje: respuesta,
+      mensaje: formatearCarrito(sesion.carrito) + `\n\n*VACIAR* o agrega más items. *LISTO* para continuar.`,
       nuevoEstado: ESTADOS.AGREGANDO_ITEMS
     };
   }
   
-  if (textoLimpio === 'VACIAR') {
-    return {
-      mensaje: "🗑️ Carrito vaciado.\n\nEscribe *MENU* para volver a elegir restaurante.",
-      nuevoEstado: ESTADOS.INICIO,
-      datos: { carrito: [] }
-    };
-  }
-  
   return {
-    mensaje: "Por favor responde:\n\n✅ *SI* para continuar\n❌ *NO* para modificar",
+    mensaje: "✅ *SI* para continuar\n❌ *NO* para modificar",
     nuevoEstado: ESTADOS.CONFIRMANDO_CARRITO
   };
 }
 
-function manejarDireccion(telefono, mensaje, sesion, ubicacion = null) {
-  let direccion, referencia;
+// NUEVO: Manejar gestión de direcciones
+async function manejarGestionDireccion(telefono, sesion, usuario) {
+  const direcciones = await obtenerDireccionesGuardadas(usuario.id);
+  
+  if (direcciones.length === 0) {
+    let respuesta = `📍 *DIRECCIÓN DE ENTREGA*\n\n`;
+    respuesta += `No tienes direcciones guardadas.\n\n`;
+    respuesta += `Envía tu *ubicación* 📍 o escribe tu dirección:\n\n`;
+    respuesta += `Ejemplo: _Av. Arequipa 1234, dpto 501_`;
+    
+    return {
+      mensaje: respuesta,
+      nuevoEstado: ESTADOS.INGRESANDO_DIRECCION_NUEVA,
+      datos: { direccionesGuardadas: [] }
+    };
+  }
+  
+  let respuesta = `📍 *DIRECCIÓN DE ENTREGA*\n\n`;
+  respuesta += `Selecciona una dirección:\n\n`;
+  
+  direcciones.forEach((dir, index) => {
+    const emoji = dir.is_default ? '⭐' : '📍';
+    respuesta += `*${index + 1}.* ${emoji} ${dir.label}\n`;
+    respuesta += `   ${dir.address}\n`;
+    if (dir.reference) {
+      respuesta += `   🏢 ${dir.reference}\n`;
+    }
+    respuesta += `\n`;
+  });
+  
+  respuesta += `━━━━━━━━━━━━━━━━━━━━━━━\n`;
+  respuesta += `📝 Escribe el número\n`;
+  respuesta += `O escribe *NUEVA* para agregar otra dirección`;
+  
+  return {
+    mensaje: respuesta,
+    nuevoEstado: ESTADOS.SELECCIONANDO_DIRECCION_GUARDADA,
+    datos: { direccionesGuardadas: direcciones }
+  };
+}
+
+async function manejarSeleccionDireccionGuardada(telefono, mensaje, sesion) {
+  const textoLimpio = mensaje.trim().toUpperCase();
+  
+  if (textoLimpio === 'NUEVA' || textoLimpio === 'OTRA') {
+    let respuesta = `📍 *NUEVA DIRECCIÓN*\n\n`;
+    respuesta += `Envía tu *ubicación* 📍 o escribe tu dirección completa.`;
+    
+    return {
+      mensaje: respuesta,
+      nuevoEstado: ESTADOS.INGRESANDO_DIRECCION_NUEVA
+    };
+  }
+  
+  const numero = parseInt(mensaje.trim());
+  
+  if (isNaN(numero) || numero < 1 || numero > sesion.direccionesGuardadas.length) {
+    return {
+      mensaje: `❌ Opción inválida.\n\nEscribe 1-${sesion.direccionesGuardadas.length} o *NUEVA*`,
+      nuevoEstado: ESTADOS.SELECCIONANDO_DIRECCION_GUARDADA
+    };
+  }
+  
+  const dirSeleccionada = sesion.direccionesGuardadas[numero - 1];
+  
+  // Calcular delivery
+  const deliveryInfo = await calcularDelivery(
+    sesion.restaurante.id,
+    dirSeleccionada.latitude,
+    dirSeleccionada.longitude
+  );
+  
+  let respuesta = `📍 Dirección seleccionada:\n`;
+  respuesta += `${dirSeleccionada.address}\n`;
+  if (dirSeleccionada.reference) {
+    respuesta += `🏢 ${dirSeleccionada.reference}\n`;
+  }
+  respuesta += `\n━━━━━━━━━━━━━━━━━━━━━━━\n`;
+  
+  if (deliveryInfo.distancia > 0) {
+    respuesta += `📏 Distancia: ${deliveryInfo.distancia.toFixed(2)} km\n`;
+  }
+  respuesta += `🏍️ Costo delivery: S/ ${deliveryInfo.costo.toFixed(2)}\n`;
+  respuesta += `⏱️ Tiempo estimado: ${deliveryInfo.tiempo} min\n\n`;
+  
+  respuesta += `💳 *MÉTODO DE PAGO*\n\n`;
+  Object.keys(METODOS_PAGO).forEach((key, index) => {
+    respuesta += `*${index + 1}.* ${METODOS_PAGO[key]}\n`;
+  });
+  respuesta += `\n📝 Escribe el número`;
+  
+  return {
+    mensaje: respuesta,
+    nuevoEstado: ESTADOS.SELECCIONANDO_PAGO,
+    datos: {
+      direccion: dirSeleccionada.address,
+      referencia: dirSeleccionada.reference,
+      ubicacion: {
+        latitude: dirSeleccionada.latitude,
+        longitude: dirSeleccionada.longitude
+      },
+      distanciaKm: deliveryInfo.distancia,
+      costoDelivery: deliveryInfo.costo,
+      tiempoEstimado: deliveryInfo.tiempo
+    }
+  };
+}
+
+async function manejarDireccionNueva(telefono, mensaje, sesion, ubicacion = null, usuario = null) {
+  let direccion, lat, lng;
   
   if (ubicacion) {
     // Usuario envió ubicación GPS
-    direccion = `Lat: ${ubicacion.latitude}, Lng: ${ubicacion.longitude}`;
+    lat = ubicacion.latitude;
+    lng = ubicacion.longitude;
+    direccion = `Lat: ${lat.toFixed(6)}, Lng: ${lng.toFixed(6)}`;
     
     let respuesta = `📍 *Ubicación recibida*\n\n`;
-    respuesta += `¿Tienes alguna referencia?\n`;
-    respuesta += `_(Edificio, color de casa, punto de referencia)_\n\n`;
-    respuesta += `Ejemplo: _Edificio azul, tercer piso_\n\n`;
-    respuesta += `O escribe *OMITIR* si no tienes referencia.`;
+    respuesta += `¿Alguna referencia?\n`;
+    respuesta += `_(Casa, edificio, color, etc.)_\n\n`;
+    respuesta += `O escribe *OMITIR*`;
     
     return {
       mensaje: respuesta,
       nuevoEstado: ESTADOS.CONFIRMANDO_UBICACION,
-      datos: { 
-        ubicacion: {
-          latitude: ubicacion.latitude,
-          longitude: ubicacion.longitude
-        },
+      datos: {
+        ubicacion: { latitude: lat, longitude: lng },
         direccion: direccion
       }
     };
@@ -548,16 +770,13 @@ function manejarDireccion(telefono, mensaje, sesion, ubicacion = null) {
     
     if (direccion.length < 10) {
       return {
-        mensaje: "❌ La dirección es muy corta.\n\nPor favor escribe tu dirección completa o envía tu ubicación 📍",
-        nuevoEstado: ESTADOS.INGRESANDO_DIRECCION
+        mensaje: "❌ Dirección muy corta.\n\nEscribe tu dirección completa o envía tu ubicación 📍",
+        nuevoEstado: ESTADOS.INGRESANDO_DIRECCION_NUEVA
       };
     }
     
-    let respuesta = `📍 Dirección registrada:\n`;
-    respuesta += `_${direccion}_\n\n`;
-    respuesta += `¿Tienes alguna referencia?\n`;
-    respuesta += `_(Edificio, color de casa, punto de referencia)_\n\n`;
-    respuesta += `O escribe *OMITIR*`;
+    let respuesta = `📍 Dirección: _${direccion}_\n\n`;
+    respuesta += `¿Referencia?\n\nO escribe *OMITIR*`;
     
     return {
       mensaje: respuesta,
@@ -567,52 +786,109 @@ function manejarDireccion(telefono, mensaje, sesion, ubicacion = null) {
   }
 }
 
-function manejarReferencia(telefono, mensaje, sesion) {
+async function manejarReferencia(telefono, mensaje, sesion, usuario) {
   const textoLimpio = mensaje.trim().toUpperCase();
   
   let referencia = null;
-  if (textoLimpio !== 'OMITIR' && textoLimpio !== 'NO' && textoLimpio !== 'NINGUNA') {
+  if (textoLimpio !== 'OMITIR' && textoLimpio !== 'NO') {
     referencia = mensaje.trim();
   }
   
-  let respuesta = `💳 *MÉTODO DE PAGO*\n\n`;
-  respuesta += `Selecciona cómo pagarás:\n\n`;
+  // Calcular delivery
+  const deliveryInfo = await calcularDelivery(
+    sesion.restaurante.id,
+    sesion.ubicacion?.latitude,
+    sesion.ubicacion?.longitude
+  );
   
-  Object.keys(METODOS_PAGO).forEach((key, index) => {
-    respuesta += `*${index + 1}.* ${METODOS_PAGO[key]}\n`;
-  });
+  // Preguntar si quiere guardar la dirección
+  let respuesta = `📍 Dirección confirmada\n\n`;
   
-  respuesta += `\n📝 Escribe el número de tu opción`;
+  if (deliveryInfo.distancia > 0) {
+    respuesta += `📏 Distancia: ${deliveryInfo.distancia.toFixed(2)} km\n`;
+  }
+  respuesta += `🏍️ Costo delivery: S/ ${deliveryInfo.costo.toFixed(2)}\n`;
+  respuesta += `⏱️ Tiempo: ${deliveryInfo.tiempo} min\n\n`;
+  
+  respuesta += `¿Guardar esta dirección para futuros pedidos?\n\n`;
+  respuesta += `*1.* Sí, como "Casa"\n`;
+  respuesta += `*2.* Sí, como "Trabajo"\n`;
+  respuesta += `*3.* Sí, como "Oficina"\n`;
+  respuesta += `*4.* No guardar\n\n`;
+  respuesta += `Escribe el número:`;
   
   return {
     mensaje: respuesta,
     nuevoEstado: ESTADOS.SELECCIONANDO_PAGO,
-    datos: { referencia }
+    datos: {
+      referencia,
+      distanciaKm: deliveryInfo.distancia,
+      costoDelivery: deliveryInfo.costo,
+      tiempoEstimado: deliveryInfo.tiempo,
+      esperandoGuardarDireccion: true
+    }
   };
 }
 
-async function manejarMetodoPago(telefono, mensaje, sesion, nombre) {
+async function manejarMetodoPago(telefono, mensaje, sesion, nombre, usuario) {
+  // Si está esperando guardar dirección
+  if (sesion.esperandoGuardarDireccion) {
+    const opcion = parseInt(mensaje.trim());
+    
+    if (!isNaN(opcion) && opcion >= 1 && opcion <= 4) {
+      if (opcion <= 3) {
+        const labels = ['Casa', 'Trabajo', 'Oficina'];
+        await guardarDireccion(usuario.id, {
+          label: labels[opcion - 1],
+          address: sesion.direccion,
+          reference: sesion.referencia,
+          latitude: sesion.ubicacion?.latitude,
+          longitude: sesion.ubicacion?.longitude,
+          is_default: false
+        });
+        console.log(`✅ Dirección guardada como ${labels[opcion - 1]}`);
+      }
+      
+      // Mostrar métodos de pago
+      let respuesta = `💳 *MÉTODO DE PAGO*\n\n`;
+      Object.keys(METODOS_PAGO).forEach((key, index) => {
+        respuesta += `*${index + 1}.* ${METODOS_PAGO[key]}\n`;
+      });
+      respuesta += `\n📝 Escribe el número`;
+      
+      return {
+        mensaje: respuesta,
+        nuevoEstado: ESTADOS.SELECCIONANDO_PAGO,
+        datos: { esperandoGuardarDireccion: false }
+      };
+    }
+  }
+  
+  // Seleccionar método de pago
   const numero = parseInt(mensaje.trim());
   const metodos = Object.values(METODOS_PAGO);
   
   if (isNaN(numero) || numero < 1 || numero > metodos.length) {
     return {
-      mensaje: `❌ Opción inválida.\n\nEscribe un número del 1 al ${metodos.length}`,
+      mensaje: `❌ Opción inválida.\n\nEscribe 1-${metodos.length}`,
       nuevoEstado: ESTADOS.SELECCIONANDO_PAGO
     };
   }
   
   const metodoPago = metodos[numero - 1];
   
-  // Crear pedido en BD
   try {
     actualizarSesion(telefono, { metodoPago });
     const sesionActualizada = obtenerSesion(telefono);
-    sesionActualizada.restaurante = sesion.restaurante; // Asegurar que tenga el restaurante
     
-    const pedido = await crearPedido(telefono, sesionActualizada);
+    const deliveryInfo = {
+      costo: sesionActualizada.costoDelivery || 5.00,
+      distancia: sesionActualizada.distanciaKm || 0,
+      tiempo: sesionActualizada.tiempoEstimado || 30
+    };
     
-    // Generar voucher
+    const pedido = await crearPedido(telefono, sesionActualizada, deliveryInfo);
+    
     const voucher = generarVoucher({
       numeroOrden: pedido.order_number,
       createdAt: pedido.created_at,
@@ -620,23 +896,19 @@ async function manejarMetodoPago(telefono, mensaje, sesion, nombre) {
       carrito: sesion.carrito,
       direccion: sesion.direccion,
       referencia: sesion.referencia,
-      metodoPago: metodoPago,
-      costoDelivery: pedido.delivery_fee
-    });
+      metodoPago: metodoPago
+    }, deliveryInfo);
     
     return {
       mensaje: voucher,
       nuevoEstado: ESTADOS.PEDIDO_ACTIVO,
-      datos: { 
-        pedidoActual: pedido,
-        metodoPago
-      }
+      datos: { pedidoActual: pedido }
     };
     
   } catch (error) {
     console.error("Error creando pedido:", error);
     return {
-      mensaje: "❌ Hubo un error al procesar tu pedido.\n\nPor favor intenta nuevamente o contacta a soporte.",
+      mensaje: "❌ Error al procesar tu pedido.\n\nContacta a soporte.",
       nuevoEstado: ESTADOS.INICIO
     };
   }
@@ -645,63 +917,51 @@ async function manejarMetodoPago(telefono, mensaje, sesion, nombre) {
 function manejarPedidoActivo(telefono, mensaje, sesion) {
   const textoLimpio = mensaje.trim().toUpperCase();
   
-  if (textoLimpio === 'RASTREAR' || textoLimpio === 'ESTADO' || textoLimpio === 'TRACKING') {
-    let respuesta = `📦 *ESTADO DE TU PEDIDO*\n\n`;
+  if (textoLimpio === 'RASTREAR' || textoLimpio === 'ESTADO') {
+    let respuesta = `📦 *ESTADO DEL PEDIDO*\n\n`;
     respuesta += `📋 Orden: ${sesion.pedidoActual.order_number}\n`;
-    respuesta += `🏪 Restaurante: ${sesion.restaurante.name}\n\n`;
+    respuesta += `🏪 ${sesion.restaurante.name}\n\n`;
     respuesta += `━━━━━━━━━━━━━━━━━━━━━━━\n`;
     respuesta += `✅ Pedido recibido\n`;
     respuesta += `🍳 En preparación...\n`;
-    respuesta += `⏱️ Tiempo estimado: 35-45 min\n\n`;
-    respuesta += `Te avisaremos cuando salga el motorizado 🏍️`;
+    respuesta += `⏱️ Tiempo estimado: ${sesion.tiempoEstimado || 30} min\n\n`;
+    respuesta += `Te avisaremos cuando salga 🏍️`;
     
-    return {
-      mensaje: respuesta,
-      nuevoEstado: ESTADOS.PEDIDO_ACTIVO
-    };
-  }
-  
-  if (textoLimpio === 'NUEVO' || textoLimpio === 'MENU') {
-    return {
-      mensaje: "Ya tienes un pedido en curso.\n\nEscribe *RASTREAR* para ver su estado.\n\nCuando se entregue, podrás hacer un nuevo pedido.",
-      nuevoEstado: ESTADOS.PEDIDO_ACTIVO
-    };
+    return { mensaje: respuesta, nuevoEstado: ESTADOS.PEDIDO_ACTIVO };
   }
   
   return {
-    mensaje: `Tienes un pedido activo (#${sesion.pedidoActual.order_number}).\n\nComandos disponibles:\n• *RASTREAR* - Ver estado\n• *AYUDA* - Soporte`,
+    mensaje: `Pedido activo (#${sesion.pedidoActual.order_number}).\n\n*RASTREAR* - Ver estado\n*AYUDA* - Soporte`,
     nuevoEstado: ESTADOS.PEDIDO_ACTIVO
   };
 }
 
 // --- MANEJADOR PRINCIPAL ---
 
-async function procesarMensaje(telefono, mensaje, nombre, ubicacion = null) {
+async function procesarMensaje(telefono, mensaje, nombre, ubicacion = null, usuario = null) {
   const sesion = obtenerSesion(telefono);
   let resultado;
   
-  // Comandos globales
   const textoLimpio = mensaje.trim().toUpperCase();
   
-  if (textoLimpio === 'MENU' || textoLimpio === 'INICIO' || textoLimpio === 'EMPEZAR') {
+  // Comandos globales
+  if (textoLimpio === 'MENU' || textoLimpio === 'INICIO') {
     limpiarSesion(telefono);
     resultado = await manejarInicio(telefono, nombre);
   }
-  else if (textoLimpio === 'AYUDA' || textoLimpio === 'HELP') {
+  else if (textoLimpio === 'AYUDA') {
     const ayuda = `🆘 *AYUDA*\n\n` +
-      `*Comandos disponibles:*\n` +
+      `*Comandos:*\n` +
       `• MENU - Ver restaurantes\n` +
-      `• VER - Ver tu carrito\n` +
-      `• LISTO - Confirmar pedido\n` +
+      `• VER - Ver carrito\n` +
+      `• LISTO - Confirmar\n` +
       `• VACIAR - Limpiar carrito\n` +
-      `• RASTREAR - Ver estado de pedido\n` +
-      `• AYUDA - Este mensaje\n\n` +
+      `• RASTREAR - Estado pedido\n\n` +
       `📞 Soporte: +51 987 654 321`;
     
     return { mensaje: ayuda, nuevoEstado: sesion.estado };
   }
   else {
-    // Procesar según estado actual
     switch (sesion.estado) {
       case ESTADOS.INICIO:
         resultado = await manejarInicio(telefono, nombre);
@@ -719,16 +979,24 @@ async function procesarMensaje(telefono, mensaje, nombre, ubicacion = null) {
         resultado = manejarConfirmarCarrito(telefono, mensaje, sesion);
         break;
       
-      case ESTADOS.INGRESANDO_DIRECCION:
-        resultado = manejarDireccion(telefono, mensaje, sesion, ubicacion);
+      case ESTADOS.GESTIONANDO_DIRECCION:
+        resultado = await manejarGestionDireccion(telefono, sesion, usuario);
+        break;
+      
+      case ESTADOS.SELECCIONANDO_DIRECCION_GUARDADA:
+        resultado = await manejarSeleccionDireccionGuardada(telefono, mensaje, sesion);
+        break;
+      
+      case ESTADOS.INGRESANDO_DIRECCION_NUEVA:
+        resultado = await manejarDireccionNueva(telefono, mensaje, sesion, ubicacion, usuario);
         break;
       
       case ESTADOS.CONFIRMANDO_UBICACION:
-        resultado = manejarReferencia(telefono, mensaje, sesion);
+        resultado = await manejarReferencia(telefono, mensaje, sesion, usuario);
         break;
       
       case ESTADOS.SELECCIONANDO_PAGO:
-        resultado = await manejarMetodoPago(telefono, mensaje, sesion, nombre);
+        resultado = await manejarMetodoPago(telefono, mensaje, sesion, nombre, usuario);
         break;
       
       case ESTADOS.PEDIDO_ACTIVO:
@@ -740,7 +1008,6 @@ async function procesarMensaje(telefono, mensaje, nombre, ubicacion = null) {
     }
   }
   
-  // Actualizar sesión con nuevo estado y datos
   if (resultado.nuevoEstado) {
     actualizarSesion(telefono, {
       estado: resultado.nuevoEstado,
@@ -755,8 +1022,8 @@ async function procesarMensaje(telefono, mensaje, nombre, ubicacion = null) {
 
 app.get("/", (req, res) => {
   res.json({
-    status: "🤖 Musuq Delivery Bot v3.0",
-    system: "Sistema de pedidos completo",
+    status: "🤖 Musuq Delivery Bot v4.0",
+    features: ["Gestión de direcciones", "Cálculo automático de delivery", "Botones interactivos"],
     sesiones_activas: sesiones.size
   });
 });
@@ -797,24 +1064,24 @@ app.post("/webhook", async (req, res) => {
         longitude: message.location.longitude
       };
       textoMensaje = "📍 Ubicación recibida";
-      console.log(`📍 ${nombre} envió ubicación:`, ubicacion);
+      console.log(`📍 ${nombre} envió ubicación`);
+    } else if (message.type === "interactive") {
+      // Manejar respuesta de botones
+      textoMensaje = message.interactive.button_reply.title;
+      console.log(`🔘 ${nombre} presionó: ${textoMensaje}`);
     } else {
-      console.log(`⚠️ Tipo de mensaje no soportado: ${message.type}`);
-      await enviarMensajeWhatsApp(telefono, "Lo siento, solo puedo procesar mensajes de texto y ubicaciones 📍");
+      console.log(`⚠️ Tipo no soportado: ${message.type}`);
+      await enviarMensajeWhatsApp(telefono, "Solo puedo procesar texto y ubicaciones 📍");
       return;
     }
 
-    // Obtener/crear usuario
-    await obtenerUsuario(telefono, nombre);
-
-    // Procesar mensaje
-    const respuesta = await procesarMensaje(telefono, textoMensaje, nombre, ubicacion);
+    const usuario = await obtenerUsuario(telefono, nombre);
+    const respuesta = await procesarMensaje(telefono, textoMensaje, nombre, ubicacion, usuario);
     
-    // Enviar respuesta
     await enviarMensajeWhatsApp(telefono, respuesta);
 
   } catch (error) {
-    console.error("❌ Error en webhook:", error);
+    console.error("❌ Error webhook:", error);
   }
 });
 
@@ -824,7 +1091,7 @@ app.get("/stats", (req, res) => {
     por_estado: {}
   };
   
-  for (const [telefono, sesion] of sesiones.entries()) {
+  for (const [, sesion] of sesiones.entries()) {
     const estado = sesion.estado;
     stats.por_estado[estado] = (stats.por_estado[estado] || 0) + 1;
   }
@@ -835,30 +1102,13 @@ app.get("/stats", (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`
 ╔═════════════════════════════════════════╗
-║   🤖 MUSUQ DELIVERY BOT v3.0           ║
-║   📦 Sistema de Pedidos Completo       ║
-║   🚀 Puerto: ${PORT}                       ║
+║   🤖 MUSUQ DELIVERY BOT v4.0           ║
+║   📍 Geolocalización integrada         ║
+║   💾 Direcciones guardadas             ║
+║   📏 Cálculo automático de delivery    ║
 ╚═════════════════════════════════════════╝
 
-✅ Sistema iniciado correctamente
-📊 Visita /stats para ver estadísticas
+✅ Sistema iniciado
+📊 /stats para estadísticas
   `);
-  
-  // Limpiar sesiones inactivas cada hora
-  setInterval(() => {
-    const ahora = new Date();
-    let eliminadas = 0;
-    
-    for (const [telefono, sesion] of sesiones.entries()) {
-      // Si no hay pedido activo y pasaron 2 horas, limpiar
-      if (sesion.estado !== ESTADOS.PEDIDO_ACTIVO) {
-        eliminadas++;
-        sesiones.delete(telefono);
-      }
-    }
-    
-    if (eliminadas > 0) {
-      console.log(`🧹 ${eliminadas} sesiones inactivas limpiadas`);
-    }
-  }, 60 * 60 * 1000);
 });
