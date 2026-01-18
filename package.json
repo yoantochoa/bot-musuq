@@ -1,20 +1,17 @@
 {
   "name": "bot-musuq",
-  "version": "1.0.0",
-  "description": "",
+  "version": "2.0.0",
+  "description": "Bot de WhatsApp con Cohere AI",
   "main": "index.js",
-    "scripts": {
-      "start": "node index.js", 
-      "test": "echo \"Error: no test specified\" && exit 1"
+  "scripts": {
+    "start": "node index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
   "type": "module",
   "dependencies": {
-    "@google/generative-ai": "^0.24.1",
     "@supabase/supabase-js": "^2.90.1",
     "axios": "^1.13.2",
+    "cohere-ai": "^7.14.0",
     "dotenv": "^17.2.3",
     "express": "^5.2.1"
   }
