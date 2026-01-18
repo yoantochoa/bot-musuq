@@ -66,40 +66,52 @@ async function enviarMensajeWhatsApp(telefono, texto) {
 }
 
 // NUEVO: Enviar mensaje con botones interactivos
-async function enviarMensajeConBotones(telefono, texto, botones) {
-  try {
-    const buttons = botones.map((btn, idx) => ({
-      type: "reply",
-      reply: {
-        id: `btn_${idx}`,
-        title: btn.substring(0, 20) // WhatsApp limita a 20 caracteres
-      }
-    }));
-
-    await axios({
-      method: "POST",
-      url: `https://graph.facebook.com/v17.0/${WHATSAPP_PHONE_ID}/messages`,
-      headers: {
-        "Authorization": `Bearer ${WHATSAPP_TOKEN}`,
-        "Content-Type": "application/json",
-      },
-      data: {
-        messaging_product: "whatsapp",
-        to: telefono,
-        type: "interactive",
-        interactive: {
-          type: "button",
-          body: { text: texto },
-          action: { buttons: buttons.slice(0, 3) } // Máximo 3 botones
+async function enviarMensajeConBotones(telefono, texto, opciones) {
+  // WhatsApp solo soporta hasta 3 botones
+  if (opciones.length <= 3) {
+    try {
+      const buttons = opciones.map((opcion, idx) => ({
+        type: "reply",
+        reply: {
+          id: `opt_${idx}`,
+          title: opcion.texto.substring(0, 20) // Máximo 20 caracteres
         }
-      },
-    });
-    console.log("✅ Mensaje con botones enviado");
-  } catch (error) {
-    console.error("❌ Error enviando botones:", error.response?.data || error.message);
-    // Fallback: enviar como texto normal
-    await enviarMensajeWhatsApp(telefono, texto + "\n\n" + botones.map((b, i) => `${i+1}. ${b}`).join("\n"));
+      }));
+
+      await axios({
+        method: "POST",
+        url: `https://graph.facebook.com/v17.0/${WHATSAPP_PHONE_ID}/messages`,
+        headers: {
+          "Authorization": `Bearer ${WHATSAPP_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        data: {
+          messaging_product: "whatsapp",
+          to: telefono,
+          type: "interactive",
+          interactive: {
+            type: "button",
+            body: { text: texto },
+            action: { buttons }
+          }
+        },
+      });
+      
+      console.log("✅ Mensaje con botones enviado");
+      return true;
+    } catch (error) {
+      console.error("❌ Error enviando botones:", error.response?.data || error.message);
+    }
   }
+  
+  // Fallback: enviar como texto con números
+  let mensajeConOpciones = texto + "\n\n";
+  opciones.forEach((opcion, idx) => {
+    mensajeConOpciones += `*${idx + 1}.* ${opcion.texto}\n`;
+  });
+  
+  await enviarMensajeWhatsApp(telefono, mensajeConOpciones);
+  return false;
 }
 
 function obtenerSesion(telefono) {
@@ -163,7 +175,7 @@ async function calcularDelivery(restaurantId, latCliente, lngCliente) {
 
     if (data && data.length > 0) {
       return {
-        costo: parseFloat(data[0].delivery_cost),
+        costo: parseFloat(data[0].delivery_cost), // Ya viene redondeado de la función SQL
         distancia: parseFloat(data[0].distance_km),
         tiempo: parseInt(data[0].estimated_time_minutes)
       };
@@ -278,9 +290,9 @@ salga del restaurante.
 
 async function obtenerRestaurantesActivos() {
   const { data, error } = await supabase
-    .from('restaurants')
+    .from('restaurants_with_status')
     .select('*')
-    .eq('is_active', true)
+    .eq('is_open_now', true)  // ✅ SOLO RESTAURANTES ABIERTOS
     .order('name');
   
   if (error) {
@@ -429,19 +441,22 @@ async function manejarInicio(telefono, nombre) {
   
   if (restaurantes.length === 0) {
     return {
-      mensaje: "😔 No hay restaurantes disponibles.\n\nIntenta más tarde.",
+      mensaje: "😔 No hay restaurantes abiertos en este momento.\n\n⏰ Intenta más tarde.",
       nuevoEstado: ESTADOS.INICIO
     };
   }
   
   let mensaje = `¡Hola ${nombre}! 👋 Bienvenido a *Musuq Delivery*\n\n`;
-  mensaje += `🍽️ *RESTAURANTES DISPONIBLES:*\n\n`;
+  mensaje += `🍽️ *RESTAURANTES ABIERTOS AHORA:*\n\n`;
   
   restaurantes.forEach((rest, index) => {
-    mensaje += `*${index + 1}.* ${rest.name}\n`;
+    mensaje += `*${index + 1}.* ${rest.name} ${rest.status_display}\n`;
     mensaje += `   ${rest.description || 'Deliciosa comida'}\n`;
     if (rest.address) {
       mensaje += `   📍 ${rest.address}\n`;
+    }
+    if (rest.opening_time && rest.closing_time) {
+      mensaje += `   🕐 Horario: ${rest.opening_time.substring(0,5)} - ${rest.closing_time.substring(0,5)}\n`;
     }
     mensaje += `   ⏱️ ${rest.delivery_time || '30-40 min'}\n\n`;
   });
@@ -614,17 +629,44 @@ function manejarAgregarItems(telefono, mensaje, sesion) {
 function manejarConfirmarCarrito(telefono, mensaje, sesion) {
   const textoLimpio = mensaje.trim().toUpperCase();
   
-  if (textoLimpio === 'SI' || textoLimpio === 'SÍ' || textoLimpio === 'OK') {
+  if (textoLimpio === 'SI' || textoLimpio === 'SÍ' || textoLimpio === 'OK' || textoLimpio === '✅ CONFIRMAR') {
     return {
       mensaje: "Cargando tus direcciones...",
       nuevoEstado: ESTADOS.GESTIONANDO_DIRECCION
     };
   }
   
-  if (textoLimpio === 'NO') {
+  if (textoLimpio === 'NO' || textoLimpio === 'MODIFICAR' || textoLimpio === '✏️ MODIFICAR') {
     return {
-      mensaje: formatearCarrito(sesion.carrito) + `\n\n*VACIAR* o agrega más items. *LISTO* para continuar.`,
+      mensaje: formatearCarrito(sesion.carrito) + `\n\n*VACIAR* o agrega más. *LISTO* para continuar.`,
       nuevoEstado: ESTADOS.AGREGANDO_ITEMS
+    };
+  }
+  
+  // Si es primera vez que llega aquí, enviar con botones
+  if (!sesion.botonEnviado) {
+    const carritoTexto = formatearCarrito(sesion.carrito);
+    const subtotal = calcularSubtotal(sesion.carrito);
+    
+    let respuesta = carritoTexto + `\n\n`;
+    respuesta += `━━━━━━━━━━━━━━━━━━━━━━━\n`;
+    respuesta += `💰 *Subtotal:* S/ ${subtotal.toFixed(2)}\n`;
+    respuesta += `🏍️ *Delivery:* Se calculará según ubicación\n\n`;
+    respuesta += `¿Todo correcto?`;
+    
+    // Intentar enviar con botones
+    setTimeout(async () => {
+      await enviarMensajeConBotones(telefono, respuesta, [
+        { texto: "✅ Confirmar" },
+        { texto: "✏️ Modificar" },
+        { texto: "🗑️ Vaciar" }
+      ]);
+    }, 100);
+    
+    return {
+      mensaje: "", // No enviar texto, los botones ya fueron enviados
+      nuevoEstado: ESTADOS.CONFIRMANDO_CARRITO,
+      datos: { botonEnviado: true }
     };
   }
   
@@ -1058,18 +1100,22 @@ app.post("/webhook", async (req, res) => {
     if (message.type === "text") {
       textoMensaje = message.text.body.trim();
       console.log(`📩 ${nombre}: ${textoMensaje}`);
-    } else if (message.type === "location") {
+    } 
+    else if (message.type === "location") {
       ubicacion = {
         latitude: message.location.latitude,
         longitude: message.location.longitude
       };
       textoMensaje = "📍 Ubicación recibida";
       console.log(`📍 ${nombre} envió ubicación`);
-    } else if (message.type === "interactive") {
-      // Manejar respuesta de botones
-      textoMensaje = message.interactive.button_reply.title;
-      console.log(`🔘 ${nombre} presionó: ${textoMensaje}`);
-    } else {
+    } 
+    else if (message.type === "interactive") {
+      // ✅ MANEJAR RESPUESTA DE BOTONES
+      const buttonReply = message.interactive.button_reply;
+      textoMensaje = buttonReply.title;
+      console.log(`🔘 ${nombre} presionó botón: ${textoMensaje}`);
+    } 
+    else {
       console.log(`⚠️ Tipo no soportado: ${message.type}`);
       await enviarMensajeWhatsApp(telefono, "Solo puedo procesar texto y ubicaciones 📍");
       return;
@@ -1078,7 +1124,10 @@ app.post("/webhook", async (req, res) => {
     const usuario = await obtenerUsuario(telefono, nombre);
     const respuesta = await procesarMensaje(telefono, textoMensaje, nombre, ubicacion, usuario);
     
-    await enviarMensajeWhatsApp(telefono, respuesta);
+    // Solo enviar si hay respuesta (los botones ya se envían en manejarConfirmarCarrito)
+    if (respuesta && respuesta.trim().length > 0) {
+      await enviarMensajeWhatsApp(telefono, respuesta);
+    }
 
   } catch (error) {
     console.error("❌ Error webhook:", error);
