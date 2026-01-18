@@ -2,7 +2,7 @@ import express from "express";
 import axios from "axios";
 import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
-import { CohereClient } from "cohere-ai"; // ✅ NUEVO
+import { CohereClient } from "cohere-ai";
 
 dotenv.config();
 
@@ -12,7 +12,6 @@ app.use(express.json());
 // --- CONFIGURACIÓN ---
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// ✅ REEMPLAZA GEMINI POR COHERE
 const cohere = new CohereClient({
   token: process.env.COHERE_API_KEY,
 });
@@ -20,6 +19,9 @@ const cohere = new CohereClient({
 const PORT = process.env.PORT || 3000;
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const WHATSAPP_PHONE_ID = process.env.WHATSAPP_PHONE_ID;
+
+// Memoria de conversaciones
+const conversaciones = new Map();
 
 // --- FUNCIONES ---
 
@@ -58,10 +60,34 @@ async function obtenerResumenRestaurantes() {
   return data.map(r => `- ${r.name}: ${r.description}`).join("\n");
 }
 
-// ✅ NUEVA FUNCIÓN CON COHERE
-async function generarRespuestaIA(mensajeUsuario, nombreUsuario, infoRestaurantes) {
+async function generarRespuestaIA(mensajeUsuario, nombreUsuario, telefono, infoRestaurantes) {
   try {
-    const prompt = `Eres "MusuqBot", asistente de delivery en Perú.
+    // Obtener o crear historial
+    if (!conversaciones.has(telefono)) {
+      conversaciones.set(telefono, []);
+      console.log(`🆕 Nueva conversación: ${nombreUsuario}`);
+    }
+    
+    const historial = conversaciones.get(telefono);
+    
+    // Agregar mensaje del usuario
+    historial.push({
+      role: "USER",
+      message: mensajeUsuario,
+      timestamp: new Date().toISOString()
+    });
+    
+    // Mantener solo últimos 10 mensajes
+    if (historial.length > 10) {
+      historial.splice(0, historial.length - 10);
+    }
+
+    // Construir contexto
+    const contextoConversacion = historial
+      .map(m => `${m.role === 'USER' ? 'Cliente' : 'MusuqBot'}: ${m.message}`)
+      .join('\n');
+
+    const prompt = `Eres "MusuqBot", asistente amigable de delivery en Perú.
 
 Cliente: ${nombreUsuario}
 
@@ -69,36 +95,87 @@ Restaurantes disponibles:
 ${infoRestaurantes}
 
 Instrucciones:
-- Responde en máximo 3 líneas
-- Sé amigable y promociona los restaurantes
-- Ayuda al cliente a elegir
-- Usa emojis ocasionalmente
+- Recuerda la conversación anterior
+- Ayuda al cliente paso a paso: 1) elegir restaurante, 2) pedir dirección, 3) método de pago
+- Sé breve (máximo 3 líneas)
+- Usa emojis ocasionalmente 🍕🍔🏍️
 
-Mensaje del cliente: ${mensajeUsuario}
+CONVERSACIÓN:
+${contextoConversacion}
 
-Tu respuesta:`;
+Responde al último mensaje de forma natural y coherente:`;
 
+    console.log(`💬 Procesando mensaje de ${nombreUsuario}...`);
+
+    // ✅ MODELO ACTUALIZADO
     const response = await cohere.chat({
-      model: "command-r-plus", // Modelo gratuito más avanzado
+      model: "command-r", // ← CAMBIO AQUÍ
       message: prompt,
       temperature: 0.7,
       maxTokens: 200,
     });
 
-    const texto = response.text.trim();
-    console.log("✅ Respuesta IA (Cohere):", texto.substring(0, 50) + "...");
-    return texto;
+    const respuestaBot = response.text.trim();
+    
+    // Agregar respuesta al historial
+    historial.push({
+      role: "CHATBOT",
+      message: respuestaBot,
+      timestamp: new Date().toISOString()
+    });
+    
+    conversaciones.set(telefono, historial);
+    
+    console.log(`✅ Respuesta (${historial.length} msgs):`, respuestaBot.substring(0, 50) + "...");
+    
+    return respuestaBot;
     
   } catch (error) {
-    console.error("❌ Error Cohere:", error);
+    console.error("❌ Error Cohere:", error.message);
     
-    // Fallback sin IA
-    return `Hola ${nombreUsuario}! 👋 Tenemos estos restaurantes disponibles:\n\n${infoRestaurantes}\n\n¿Cuál te interesa?`;
+    // Fallback
+    return `Hola ${nombreUsuario}! 👋\n\nTenemos estos restaurantes:\n${infoRestaurantes}\n\n¿Cuál te interesa?`;
   }
 }
 
+function limpiarConversacionesAntiguas() {
+  const ahora = new Date();
+  const TIMEOUT_HORAS = 2;
+  
+  let eliminadas = 0;
+  
+  for (const [telefono, historial] of conversaciones.entries()) {
+    if (historial.length === 0) continue;
+    
+    const ultimoMensaje = new Date(historial[historial.length - 1].timestamp);
+    const horasInactivo = (ahora - ultimoMensaje) / (1000 * 60 * 60);
+    
+    if (horasInactivo > TIMEOUT_HORAS) {
+      conversaciones.delete(telefono);
+      eliminadas++;
+    }
+  }
+  
+  if (eliminadas > 0) {
+    console.log(`🧹 ${eliminadas} conversaciones antiguas eliminadas`);
+  }
+}
+
+async function reiniciarConversacion(telefono) {
+  conversaciones.delete(telefono);
+  console.log(`🔄 Conversación reiniciada para ${telefono}`);
+  return "🔄 Conversación reiniciada. ¡Empecemos de nuevo!\n\n¿En qué te puedo ayudar?";
+}
+
 // --- RUTAS ---
-app.get("/", (req, res) => res.send("🤖 Bot Musuq v2.0 ONLINE (Cohere AI)"));
+
+app.get("/", (req, res) => {
+  res.json({
+    status: "🤖 Bot Musuq v2.1 ONLINE",
+    engine: "Cohere AI (command-r)",
+    conversaciones_activas: conversaciones.size
+  });
+});
 
 app.get("/webhook", (req, res) => {
   const verify_token = "musuq123";
@@ -117,17 +194,23 @@ app.post("/webhook", async (req, res) => {
     const message = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
     
     if (!message || message.type !== "text") {
-      console.log("⚠️ Mensaje no válido o no es texto");
       return;
     }
 
     const telefono = message.from;
     const nombre = req.body.entry[0].changes[0].value.contacts?.[0]?.profile?.name || "Amigo";
-    const texto = message.text.body;
+    const texto = message.text.body.trim();
 
-    console.log(`📩 ${nombre} (${telefono}): ${texto}`);
+    console.log(`📩 ${nombre}: ${texto}`);
 
-    // Verificar/crear usuario
+    // Comando especial
+    if (texto.toLowerCase() === 'reiniciar') {
+      const respuesta = await reiniciarConversacion(telefono);
+      await enviarMensajeWhatsApp(telefono, respuesta);
+      return;
+    }
+
+    // Verificar usuario
     let { data: usuario, error: errorUsuario } = await supabase
       .from('users')
       .select('*')
@@ -137,36 +220,53 @@ app.post("/webhook", async (req, res) => {
     if (errorUsuario && errorUsuario.code === 'PGRST116') {
       const { data: nuevo } = await supabase
         .from('users')
-        .insert([{ 
-          phone_number: telefono, 
-          full_name: nombre,
-          created_at: new Date().toISOString()
-        }])
+        .insert([{ phone_number: telefono, full_name: nombre }])
         .select()
         .single();
       usuario = nuevo;
-      console.log("👤 Nuevo usuario creado");
+      console.log("👤 Nuevo usuario:", nombre);
     }
 
     const restaurantes = await obtenerResumenRestaurantes();
-    const respuesta = await generarRespuestaIA(texto, nombre, restaurantes);
+    const respuesta = await generarRespuestaIA(texto, nombre, telefono, restaurantes);
     
     await enviarMensajeWhatsApp(telefono, respuesta);
-    console.log("✅ Flujo completado");
 
   } catch (error) {
-    console.error("❌ Error webhook:", error);
+    console.error("❌ Error webhook:", error.message);
   }
 });
 
+app.get("/stats", (req, res) => {
+  const stats = {
+    conversaciones_activas: conversaciones.size,
+    detalles: Array.from(conversaciones.entries()).map(([tel, hist]) => ({
+      telefono: tel.slice(0, 5) + "***",
+      mensajes: hist.length,
+      ultimo: hist[hist.length - 1]?.timestamp
+    }))
+  };
+  res.json(stats);
+});
+
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Bot Musuq corriendo en puerto ${PORT}`);
-  console.log(`🤖 Motor IA: Cohere`);
-  console.log(`📝 Variables:
-  - SUPABASE_URL: ${process.env.SUPABASE_URL ? '✅' : '❌'}
-  - SUPABASE_KEY: ${process.env.SUPABASE_KEY ? '✅' : '❌'}
-  - COHERE_API_KEY: ${process.env.COHERE_API_KEY ? '✅' : '❌'}
-  - WHATSAPP_TOKEN: ${process.env.WHATSAPP_TOKEN ? '✅' : '❌'}
-  - WHATSAPP_PHONE_ID: ${process.env.WHATSAPP_PHONE_ID ? '✅' : '❌'}
+  console.log(`
+╔════════════════════════════════════════╗
+║   🤖 Bot Musuq v2.1 ONLINE            ║
+║   🧠 Cohere AI (command-r)            ║
+║   💾 Memoria en RAM                   ║
+║   🚀 Puerto: ${PORT}                      ║
+╚════════════════════════════════════════╝
+
+📝 Variables: ${[
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_KEY,
+  process.env.COHERE_API_KEY,
+  process.env.WHATSAPP_TOKEN,
+  process.env.WHATSAPP_PHONE_ID
+].every(v => v) ? '✅ Todas configuradas' : '❌ Faltan variables'}
   `);
+  
+  // Limpiar cada 30 minutos
+  setInterval(limpiarConversacionesAntiguas, 30 * 60 * 1000);
 });
