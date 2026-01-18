@@ -2,26 +2,28 @@ import express from "express";
 import axios from "axios";
 import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
-import { GoogleGenerativeAI } from "@google/generative-ai"; // <--- CAMBIO AQUÍ
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
 dotenv.config();
 
-// --- 1. CONFIGURACIÓN ---
 const app = express();
 app.use(express.json());
 
+// --- CONFIGURACIÓN ---
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// Configuración de GEMINI (Google)
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-// Usamos el modelo "flash" que es rápido para chat
-const model = genAI.getGenerativeModel({ model: "gemini-pro" });
+// 1. Limpiamos la clave por si en Railway se coló un espacio
+const apiKey = (process.env.GEMINI_API_KEY || "").trim();
+const genAI = new GoogleGenerativeAI(apiKey);
+
+// 2. USAMOS EL MODELO EXACTO (Este es el que funciona en cuentas gratuitas hoy)
+const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
 const PORT = process.env.PORT || 3000;
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const WHATSAPP_PHONE_ID = process.env.WHATSAPP_PHONE_ID;
 
-// --- 2. FUNCIONES ---
+// --- FUNCIONES ---
 
 async function enviarMensajeWhatsApp(telefono, texto) {
   try {
@@ -46,43 +48,34 @@ async function enviarMensajeWhatsApp(telefono, texto) {
 
 async function obtenerResumenRestaurantes() {
   const { data, error } = await supabase.from('restaurants').select('name, description').eq('is_active', true);
-  if (error || !data) return "No hay restaurantes activos.";
+  if (error || !data || data.length === 0) return "No hay restaurantes activos por ahora.";
   return data.map(r => `- ${r.name}: ${r.description}`).join("\n");
 }
 
-// --- NUEVA FUNCIÓN CON GEMINI ---
 async function generarRespuestaIA(mensajeUsuario, nombreUsuario, infoRestaurantes) {
   try {
-    // 1. Definimos la personalidad (Prompt del Sistema)
     const promptSistema = `
-      Eres "MusuqBot", el asistente de delivery peruano.
+      Eres "MusuqBot", asistente de delivery.
       Cliente: ${nombreUsuario}.
-      
-      Restaurantes Disponibles:
+      Restaurantes:
       ${infoRestaurantes}
-
-      Instrucciones:
-      - Responde de forma breve y amable (máximo 2 frases).
-      - Usa jergas peruanas suaves (tipo "¡Habla!", "al toque", "buenazo").
-      - Tu meta es vender. Si piden carta, resume qué tipos de comida hay.
+      
+      Responde amable y corto. Vende los restaurantes.
     `;
-
-    // 2. Unimos todo para enviarlo a Gemini
-    const promptFinal = `${promptSistema}\n\nCliente dice: "${mensajeUsuario}"\nMusuqBot responde:`;
-
-    // 3. Generamos contenido
-    const result = await model.generateContent(promptFinal);
+    
+    // Prompt simple para evitar errores de formato
+    const result = await model.generateContent(`${promptSistema}\n\nCliente: ${mensajeUsuario}`);
     const response = await result.response;
     return response.text();
     
   } catch (error) {
-    console.error("❌ Error Gemini:", error);
-    return "Uy, se me fue la señal un toque 📡. ¿Qué me decías?";
+    console.error("❌ Error Gemini Detallado:", error); // Log más detallado
+    return "Uy, se me cruzaron los cables 🔌. Intenta de nuevo.";
   }
 }
 
-// --- 3. RUTAS ---
-app.get("/", (req, res) => res.send("🤖 Bot Musuq (Powered by Gemini) 🚀"));
+// --- RUTAS ---
+app.get("/", (req, res) => res.send("🤖 Bot Musuq v1.5 ONLINE"));
 
 app.get("/webhook", (req, res) => {
   const verify_token = "musuq123";
@@ -95,10 +88,8 @@ app.get("/webhook", (req, res) => {
 
 app.post("/webhook", async (req, res) => {
   res.sendStatus(200);
-
   try {
     const message = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-
     if (message && message.type === "text") {
       const telefono = message.from;
       const nombre = req.body.entry[0].changes[0].value.contacts[0].profile.name;
@@ -106,21 +97,15 @@ app.post("/webhook", async (req, res) => {
 
       console.log(`📩 ${nombre}: ${texto}`);
 
-      // 1. Verificar usuario en BD
+      // Verificar usuario
       let { data: usuario } = await supabase.from('users').select('*').eq('phone_number', telefono).single();
-      
       if (!usuario) {
         const { data: nuevo } = await supabase.from('users').insert([{ phone_number: telefono, full_name: nombre }]).select().single();
         usuario = nuevo;
       }
 
-      // 2. Obtener data real
       const restaurantes = await obtenerResumenRestaurantes();
-
-      // 3. Pensar con GEMINI
       const respuesta = await generarRespuestaIA(texto, nombre, restaurantes);
-
-      // 4. Responder
       await enviarMensajeWhatsApp(telefono, respuesta);
     }
   } catch (error) {
@@ -128,8 +113,4 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// --- 4. ARRANCAR SERVIDOR ---
-// El '0.0.0.0' es OBLIGATORIO en Railway/Render para que escuche fuera del contenedor
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Servidor Musuq corriendo en puerto ${PORT}`);
-});
+app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Musuq corriendo en ${PORT}`));
